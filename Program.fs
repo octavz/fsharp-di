@@ -2,6 +2,7 @@
 open FSharpPlus
 open FSharpPlus.Data
 
+let run = ReaderT.run
 
 //all generic types go here 
 module Types = 
@@ -12,27 +13,51 @@ module Types =
              UserEmail : string;
              UserPassword : string}
     
-    //repositories contracts go here
-    module Repositories = 
-        open Domain
+    type Err = Err of string 
+    and Conf = {conn: string} 
 
-        type UserRepo = 
-            {getUserById : string -> User option;
-             createUser : User -> unit}
-    
-    //generic types
-    type Err = 
-        {message : String}
-    
-    type Env = 
-        {userRepo : Repositories.UserRepo}
-    
-    type App<'a> = ReaderT<Env, Result<'a, Err>>
+    and Env = {userRepo : UserRepo; version : string; conf: Conf }
 
-//big module with SQL implementations and mappers
+    and App<'a> = ReaderT<Env, Result<'a, Err>>
+    and  UserRepo = 
+        {getUserById : string -> App<Domain.User option>;
+         createUser : Domain.User -> App<unit>}
+    
+open Types
+open Types.Domain
+
+
+type AppMonadBuilder ()  =
+    let x = new MonadFxBuilder()
+    member __.Delay (expr: _->App<'T>) = x.Delay(expr)
+    member __.Run f = x.Run(f)
+
+    member  __.ReturnFrom (expr): App<'T> = expr                                       
+    member __.TryWith    (expr, handler     ) = x.TryWith(expr, handler)
+    member __.TryFinally (expr, compensation) = x.TryFinally(expr, compensation)
+    member __.Using (disposable, body) = x.Using(disposable, body)
+    member  inline __.Return (v: 'T) : App<'T> = result v
+    member  inline __.Yield (v: 'T) : App<'T> = result v
+    member  __.Combine (a: App<'T>, b) = x.Combine(a, b) : App<'T>
+    member  __.Zero (): App<unit> = result ()
+    member  __.While (guard, body): App<unit> = x.While(guard, body)
+    member  __.For (p, rest) : App<unit> = x.For(p, rest)
+    member inline __.Bind (p: App<'T>, rest: 'T->App<'U>) : App<'U> = p >>= fun x -> 
+        try rest x with e -> lift <| Error (Err e.Message) 
+
+    //  [<CustomOperation("bind", MaintainsVariableSpaceUsingBind = true)>]
+    member inline __.BindEx (p: App<'T>,  [<ProjectionParameter>] rest: 'T->App<'U>) : App<'U> = p >>= fun x -> 
+        try rest x with e -> lift <| Error (Err e.Message) 
+
+
+let flow  = new AppMonadBuilder()
+
+ //let flow  = new Builders.MonadFxBuilder()
+
+//big module with SQL implementations and mappersTypes.
+[<RequireQualifiedAccess>]
 module PgSql = 
     open Npgsql.FSharp
-    open Types.Domain
     
     let conn = 
         Sql.host "localhost"
@@ -45,70 +70,81 @@ module PgSql =
     
     let userMapper = 
         function 
-        | ["user_id", String userId; "user_email", String userEmail; 
+        | ["user_id", String userId; 
+           "user_email", String userEmail; 
            "user_password", String userPassword] -> 
             Some {UserId = userId;
                   UserEmail = userEmail;
                   UserPassword = userPassword}
         | _ -> None
     
-    let getUserById id = 
-        conn
-        |> Sql.query 
-               "select user_id,user_email,user_password from users where user_id = @userId"
-        |> Sql.parameters ["userId", String id]
-        |> Sql.executeTable
-        |> Sql.mapEachRow userMapper
-        |> List.tryHead
+    let getUserById id : App<User option> = 
+        flow {
+            return conn
+                |> Sql.query 
+                       "select user_id,user_email,user_password from users where user_id = @userId"
+                |> Sql.parameters ["userId", String id]
+                |> Sql.executeTable
+                |> Sql.mapEachRow userMapper
+                |> List.tryHead
+        }
     
-    let createUser user = 
-        conn
-        |> Sql.query 
-               "insert into users(user_id,user_email,user_password) values(@userId, @userEmail, @userPassword)"
-        |> Sql.parameters ["userId", String user.UserId;
-                           "userEmail", String user.UserEmail;
-                           "userPassword", String user.UserPassword]
-        |> Sql.executeNonQuery
-        |> ignore
+    let createUser user : App<unit>= 
+        flow {
+            return conn
+            |> Sql.query 
+                   "insert into users(user_id,user_email,user_password) values(@userId, @userEmail, @userPassword)"
+            |> Sql.parameters ["userId", String user.UserId;
+                               "userEmail", String user.UserEmail;
+                               "userPassword", String user.UserPassword]
+            |> Sql.executeNonQuery
+            |> ignore
+        }
 
 //our main program
 module Main = 
-    open Types
-    open Domain
-    let getUser userId : App<User option> = 
-        monad {let! env = ask
-               return env.userRepo.getUserById userId}
+    let getUser (userId: string) : App<User option> =  
+        flow {
+            let! env = ask 
+            let! user = env.userRepo.getUserById userId
+
+            //do! lift (Error (Err "test-err"))
+            return user
+        }
+
     let insertNewUser : App<string> = 
-        monad {
+        flow {
             let! env = ask
             let id = Guid.NewGuid().ToString()
-            
             let newUser = 
                 {UserId = id;
                  UserEmail = sprintf "%s@example.com" id;
                  UserPassword = "12345"}
-            env.userRepo.createUser newUser
+            do! env.userRepo.createUser newUser
             return id
-        }
-
-    let run : App<unit> = 
-        monad {
+        } 
+    let run : App<User option> = 
+        flow {
             let! id = insertNewUser
-            let! user = getUser id
-            printfn "%A" user
+            return! getUser id
         }
 
 //all bindings between contracts and implementations go here
 module Injector = 
-    open Types
-
+    let version = "0.1"
     let impl = 
         {userRepo = 
-            {getUserById = PgSql.getUserById;
-             createUser = PgSql.createUser }}
+            {getUserById = PgSql.getUserById; 
+             createUser = PgSql.createUser ;} 
+         version = version;
+         conf = {conn = ""}}
 
 
 [<EntryPoint>]
 let main argv =
-    printfn "%A" (ReaderT.run Main.run Injector.impl)
+    let res = ReaderT.run Main.run Injector.impl
+    match res with 
+        | Ok v -> printfn "%A" v
+        | Error (Types.Err msg) -> printfn "%s - %s"  msg "nice formatted"
+        
     0 // return an integer exit code
